@@ -1,14 +1,18 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::offset::Local;
+use chrono::{DateTime, Duration, Timelike};
 use daemonize::Daemonize;
 use nom::character::complete::{digit0, digit1};
-use nom::{alt, map, map_res, named, opt, recognize, tag, take, tuple};
 use nom::combinator::all_consuming;
+use nom::{alt, map, map_res, named, opt, recognize, tag, take, tuple};
 use serde::{Deserialize, Deserializer};
+use std::borrow::{Borrow, ToOwned};
 use std::collections::HashMap;
 use std::fs;
 use std::str::FromStr;
 use std::thread;
-use std::time::Duration;
+
+type LocalTime = DateTime<Local>;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Time {
@@ -18,7 +22,9 @@ struct Time {
 
 impl<'a> Deserialize<'a> for Time {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'a> {
+    where
+        D: Deserializer<'a>,
+    {
         use serde::de::Error;
         let string = Deserialize::deserialize(deserializer)?;
         let (_, o) = all_consuming(time)(string).map_err(Error::custom)?;
@@ -31,9 +37,25 @@ struct StaticDuration {
     end: Time,
 }
 
+impl StaticDuration {
+    fn contains(&self, time: &LocalTime) -> bool {
+        let t = Time {
+            hours: time.hour(),
+            minutes: time.minute(),
+        };
+        if self.begin < self.end {
+            self.begin <= t && t < self.end
+        } else {
+            self.end <= t || t < self.begin
+        }
+    }
+}
+
 impl<'a> Deserialize<'a> for StaticDuration {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'a> {
+    where
+        D: Deserializer<'a>,
+    {
         use serde::de::Error;
         let string = Deserialize::deserialize(deserializer)?;
         let (_, o) = all_consuming(static_duration)(string).map_err(Error::custom)?;
@@ -46,26 +68,28 @@ enum DurationUnit {
     Hours,
 }
 
-struct DynamicDuration {
-    duration: f64,
-    unit: DurationUnit,
-}
-
-impl<'a> Deserialize<'a> for DynamicDuration {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'a> {
-        use serde::de::Error;
-        let string = Deserialize::deserialize(deserializer)?;
-        let (_, o) = all_consuming(dybamic_duration)(string).map_err(Error::custom)?;
-        Ok(o)
-    }
+fn deserialize_hm<'a, D>(deserializer: D) -> Result<chrono::Duration, D::Error>
+where
+    D: Deserializer<'a>,
+{
+    use serde::de::Error;
+    let string = Deserialize::deserialize(deserializer)?;
+    let (_, o) = all_consuming(mh_duration)(string).map_err(Error::custom)?;
+    Ok(o.into())
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Restriction {
-    Static { unlock: Vec<StaticDuration> },
-    Dynamic { period: DynamicDuration, cool_time: DynamicDuration },
+    Static {
+        unlock: Vec<StaticDuration>,
+    },
+    Dynamic {
+        #[serde(deserialize_with = "deserialize_hm")]
+        period: chrono::Duration,
+        #[serde(deserialize_with = "deserialize_hm")]
+        cool_time: chrono::Duration,
+    },
 }
 
 #[derive(Deserialize)]
@@ -77,6 +101,8 @@ struct Entry {
 
 #[derive(Deserialize)]
 struct Config {
+    after_lock: Option<String>,
+    after_unlock: Option<String>,
     #[serde(deserialize_with = "deserialize_secs", default = "default_interval")]
     interval: Duration,
     #[serde(flatten)]
@@ -88,11 +114,11 @@ where
     D: Deserializer<'a>,
 {
     let seconds = Deserialize::deserialize(deserializer)?;
-    Ok(Duration::from_secs(seconds))
+    Ok(Duration::seconds(seconds))
 }
 
 fn default_interval() -> Duration {
-    Duration::from_secs(60)
+    Duration::seconds(60)
 }
 
 named!(two_digits(&str) -> u32, map_res!(take!(2), u32::from_str));
@@ -122,11 +148,72 @@ named!(unit(&str) -> DurationUnit,
     | map!(tag!("m") ,|_| DurationUnit::Minutes)
     )
 );
-named!(dybamic_duration(&str) -> DynamicDuration,
+named!(mh_duration(&str) -> Duration,
     map!(tuple!(float, unit), |(d, u)| {
-        DynamicDuration { duration: d, unit: u }
+        match u {
+            DurationUnit::Minutes => Duration::minutes(d.trunc() as i64),
+            DurationUnit::Hours   => Duration::hours(d.trunc() as i64) + Duration::minutes((d.fract() / 60.).trunc() as i64)
+        }
     })
 );
+
+struct State {
+    last_unlocked: HashMap<String, LocalTime>,
+    last_locked: HashMap<String, LocalTime>,
+    is_locked: HashMap<String, bool>,
+}
+
+trait MutDict<V> {
+    fn set(&mut self, key: &str, value: V);
+}
+
+impl<V> MutDict<V> for HashMap<String, V> {
+    fn set(&mut self, key: &str, value: V) {
+        match self.get_mut(key) {
+            Some(dist) => {
+                *dist = value;
+            }
+            None => {
+                self.insert(key.to_owned(), value);
+            }
+        }
+    }
+}
+
+impl State {
+    fn unlock(&mut self, name: &str, entry: &Entry) -> Result<()> {
+        if !self.is_locked[name] {
+            return Ok(());
+        }
+        if let Restriction::Dynamic { cool_time, .. } = entry.restriction {
+            if let Some(last_unlocked) = self.last_unlocked.get(name) {
+                if Local::now() < *last_unlocked + cool_time.clone() {
+                    return Err(anyhow!("Not have been cool down yet"));
+                }
+            }
+        }
+
+        self.is_locked.set(name, false);
+        if let Restriction::Dynamic { .. } = entry.restriction {
+            self.last_unlocked.set(name, Local::now());
+        }
+
+        Ok(())
+    }
+
+    fn lock(&mut self, name: &str, entry: &Entry) -> Result<()> {
+        if self.is_locked[name] {
+            return Ok(());
+        }
+
+        self.is_locked.set(name, true);
+        if let Restriction::Dynamic { .. } = entry.restriction {
+            self.last_locked.set(name, Local::now());
+        }
+
+        Ok(())
+    }
+}
 
 fn read_config_file() -> Result<String> {
     let xdg_dirs = xdg::BaseDirectories::with_prefix("senklot")?;
@@ -148,8 +235,37 @@ fn daemonize() -> Result<()> {
 fn main() -> Result<()> {
     let config = read_config_file()?;
     let config = parse_config(&config)?;
+    let mut state = State {
+        last_unlocked: HashMap::new(),
+        last_locked: HashMap::new(),
+        is_locked: HashMap::new(),
+    };
     daemonize()?;
     loop {
-        thread::sleep(config.interval);
+        let now: LocalTime = Local::now();
+        for (name, entry) in &config.entries {
+            match &entry.restriction {
+                Restriction::Static { unlock } => {
+                    if unlock.iter().any(|d| d.contains(&now)) {
+                        let _ = state.unlock(&name, &entry);
+                    } else {
+                        let _ = state.lock(&name, &entry);
+                    }
+                }
+                Restriction::Dynamic { period, .. } => {
+                    if state
+                        .last_unlocked
+                        .get(name)
+                        .map(|last_unlocked| now < *last_unlocked + period.clone())
+                        .unwrap_or(true)
+                    {
+                        let _ = state.unlock(&name, &entry);
+                    } else {
+                        let _ = state.lock(&name, &entry);
+                    }
+                }
+            }
+        }
+        thread::sleep(config.interval.to_std().unwrap());
     }
 }
