@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, Timelike};
 use daemonize::Daemonize;
 use nom::character::complete::{none_of, digit0, digit1, space0, space1};
 use nom::combinator::all_consuming;
-use nom::{alt, many1, map, map_res, named, none_of, opt, recognize, tag, take, tuple};
+use nom::{alt, many1, map, map_res, named,  opt, recognize, tag, take, tuple};
 use serde::{Deserialize, Deserializer};
 use std::borrow::ToOwned;
 use std::collections::HashMap;
@@ -12,6 +12,7 @@ use std::fs;
 use std::fs::File;
 use std::str::FromStr;
 use std::thread;
+use std::path::Path;
 
 type LocalTime = DateTime<Local>;
 
@@ -197,8 +198,25 @@ impl<V> MutDict<V> for HashMap<String, V> {
 }
 
 impl State {
+    fn load_with(config: &Config) -> State {
+        let mut domain_map = HashMap::new();
+        for (name, entry) in &config.entries {
+            for domain in &entry.domains {
+                domain_map.insert(domain.clone(), name.clone());
+            }
+        }
+
+        State {
+            domain_map: domain_map,
+            last_unlocked: HashMap::new(),
+            last_locked: HashMap::new(),
+            is_locked: HashMap::new()
+        }
+    }
+
     fn unlock(&mut self, name: &str, entry: &Entry) -> Result<()> {
-        if !self.is_locked.get(name).unwrap_or(&false) {
+        println!("pre {}", self.is_locked.get(name).unwrap_or(&false));
+        if !self.is_locked.get(name).unwrap_or(&true) {
             return Ok(());
         }
         if let Restriction::Dynamic { cool_time, .. } = entry.restriction {
@@ -214,7 +232,9 @@ impl State {
             self.last_unlocked.set(name, Local::now());
         }
 
-        let _ = self.commit();
+        println!("{}", self.is_locked[name]);
+
+        self.commit()?;
 
         Ok(())
     }
@@ -336,8 +356,9 @@ fn read_hosts() -> Result<String> {
 }
 
 fn read_config_file() -> Result<String> {
-    let xdg_dirs = xdg::BaseDirectories::with_prefix("senklot")?;
-    let config_file = xdg_dirs.find_config_file("config").ok_or(anyhow!(""))?;
+    //let xdg_dirs = xdg::BaseDirectories::with_prefix("senklot")?;
+    //let config_file = xdg_dirs.find_config_file("config").ok_or(anyhow!("Could not find config directory"))?;
+    let config_file = "/home/takagiy/.config/senklot/config";
     let content = fs::read_to_string(config_file)?;
     Ok(content)
 }
@@ -347,10 +368,18 @@ fn parse_config(config: &str) -> Result<Config> {
     Ok(config)
 }
 
+fn open_file<P : AsRef<Path>>(path: P) -> Result<File> {
+    let file = File::create(path.as_ref()).or_else(|_| File::open(path))?;
+    Ok(file)
+}
+
 fn daemonize() -> Result<()> {
-    let stdout = File::create("/tmp/senklot.log")?;
+    let stdout = open_file("/tmp/senklot.log").with_context(|| "cannot open stdout")?;
+    let stderr = open_file("/tmp/senklot.err").with_context(|| "cannot open stderr")?;
     let _ = Daemonize::new()
         .stdout(stdout)
+        .stderr(stderr)
+        .chown_pid_file(true)
         .pid_file("/tmp/senklot.pid")
         .start()?;
     Ok(())
@@ -359,12 +388,7 @@ fn daemonize() -> Result<()> {
 fn main() -> Result<()> {
     let config = read_config_file()?;
     let config = parse_config(&config)?;
-    let mut state = State {
-        last_unlocked: HashMap::new(),
-        last_locked: HashMap::new(),
-        is_locked: HashMap::new(),
-        domain_map: HashMap::new(),
-    };
+    let mut state = State::load_with(&config);
 
     // For debug
     let hosts = Hosts::parse(read_hosts()?);
@@ -382,9 +406,17 @@ fn main() -> Result<()> {
             match &entry.restriction {
                 Restriction::Static { unlock } => {
                     if unlock.iter().any(|d| d.contains(&now)) {
-                        let _ = state.unlock(&name, &entry);
+                        println!("unlock {}", &name);
+                        let e = state.unlock(&name, &entry);
+                        if let Err(e) = e {
+                            println!("{:?}", e);
+                        }
                     } else {
-                        let _ = state.lock(&name, &entry);
+                        println!("lock");
+                        let e = state.lock(&name, &entry);
+                        if let Err(e) = e {
+                            println!("{:?}", e);
+                        }
                     }
                 }
                 Restriction::Dynamic { period, .. } => {
