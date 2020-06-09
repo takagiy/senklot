@@ -17,4 +17,7 @@ anyhow = "1.0.31"
 serde = { version = "1.0.111", features = ["derive"] }
 xdg = "2.2.0"
 nom = "5.1.1"
-chrono = "0.4.11"
+chrono = { version = "0.4.11", features = ["serde"] }
+bincode = "1.2.1"
+ctrlc = { version = "3.1.4", features = ["termination"] }
+crossbeam = "0.7.3"

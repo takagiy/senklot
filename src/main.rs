@@ -1,18 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::offset::Local;
 use chrono::{DateTime, Duration, Timelike};
+use crossbeam::channel::{select, tick};
 use daemonize::Daemonize;
-use nom::character::complete::{none_of, digit0, digit1, space0, space1};
+use nom::character::complete::{digit0, digit1, none_of, space0, space1};
 use nom::combinator::all_consuming;
-use nom::{alt, many1, map, map_res, named,  opt, recognize, tag, take, tuple};
-use serde::{Deserialize, Deserializer};
+use nom::{alt, many1, map, map_res, named, opt, recognize, tag, take, tuple};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
+use std::path::Path;
 use std::str::FromStr;
 use std::thread;
-use std::path::Path;
+use crossbeam::channel;
+use std::process;
 
 type LocalTime = DateTime<Local>;
 
@@ -173,10 +176,12 @@ named!(host(&str) -> (String, Host),
         )
 );
 
+#[derive(Deserialize, Serialize)]
 struct State {
     last_unlocked: HashMap<String, LocalTime>,
     last_locked: HashMap<String, LocalTime>,
     is_locked: HashMap<String, bool>,
+    #[serde(skip)]
     domain_map: HashMap<String, String>,
 }
 
@@ -198,7 +203,7 @@ impl<V> MutDict<V> for HashMap<String, V> {
 }
 
 impl State {
-    fn load_with(config: &Config) -> State {
+    fn load_with(config: &Config, state_file: Option<Vec<u8>>) -> State {
         let mut domain_map = HashMap::new();
         for (name, entry) in &config.entries {
             for domain in &entry.domains {
@@ -206,12 +211,28 @@ impl State {
             }
         }
 
+        let state = match state_file {
+            Some(state_file) => bincode::deserialize(&state_file).unwrap_or(State::empty()),
+            None => State::empty(),
+        };
+
         State {
             domain_map: domain_map,
+            ..state
+        }
+    }
+
+    fn empty() -> State {
+        State {
+            domain_map: HashMap::new(),
             last_unlocked: HashMap::new(),
             last_locked: HashMap::new(),
-            is_locked: HashMap::new()
+            is_locked: HashMap::new(),
         }
+    }
+
+    fn export(&self) -> Vec<u8> {
+        bincode::serialize(&self).unwrap()
     }
 
     fn unlock(&mut self, name: &str, entry: &Entry) -> Result<()> {
@@ -282,6 +303,37 @@ impl State {
         write_hosts(&hosts_file)?;
 
         Ok(())
+    }
+
+    fn update(&mut self, config: &Config) {
+        let now: LocalTime = Local::now();
+        for (name, entry) in &config.entries {
+            match &entry.restriction {
+                Restriction::Static { unlock } => {
+                    if unlock.iter().any(|d| d.contains(&now)) {
+                        if let Err(e) = self.unlock(&name, &entry) {
+                            println!("{:?}", e);
+                        }
+                    } else {
+                        if let Err(e) = self.lock(&name, &entry) {
+                            println!("{:?}", e);
+                        }
+                    }
+                }
+                Restriction::Dynamic { period, .. } => {
+                    if self
+                        .last_unlocked
+                        .get(name)
+                        .map(|last_unlocked| now < *last_unlocked + period.clone())
+                        .unwrap_or(true)
+                    {
+                        let _ = self.unlock(&name, &entry);
+                    } else {
+                        let _ = self.lock(&name, &entry);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -363,12 +415,22 @@ fn read_config_file() -> Result<String> {
     Ok(content)
 }
 
+fn read_state_file() -> Result<Option<Vec<u8>>> {
+    let path = Path::new("/var/lib/senklot");
+    if path.is_file() {
+        let content = fs::read(path)?;
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
+}
+
 fn parse_config(config: &str) -> Result<Config> {
     let config = toml::from_str(config)?;
     Ok(config)
 }
 
-fn open_file<P : AsRef<Path>>(path: P) -> Result<File> {
+fn open_file<P: AsRef<Path>>(path: P) -> Result<File> {
     let file = File::create(path.as_ref()).or_else(|_| File::open(path))?;
     Ok(file)
 }
@@ -385,54 +447,36 @@ fn daemonize() -> Result<()> {
     Ok(())
 }
 
+fn main_loop(config: Config, mut state: State) -> Result<()> {
+    let ticker = tick(config.interval.to_std().unwrap());
+    let (exit_send, exit) = channel::bounded(1);
+    ctrlc::set_handler(move || {
+        let _ = exit_send.send(());
+    })?;
+    loop {
+        select! {
+            recv(ticker) -> _ => {
+                state.update(&config);
+
+            },
+            recv(exit) -> _ => {
+                if let Err(e) = fs::write("/var/lib/senklot", state.export()) {
+                    println!("{:?}", e);
+                }
+                process::exit(0);
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let config = read_config_file()?;
     let config = parse_config(&config)?;
-    let mut state = State::load_with(&config);
-
-    // For debug
-    let hosts = Hosts::parse(read_hosts()?);
-    for domain in hosts.hosts.keys() {
-        println!("{}", domain);
-    }
-    println!("{}", hosts.export());
-    let (i, d) = addr_domain("abc#")?;
-    println!("{}", d);
+    let state = read_state_file()?;
+    let state = State::load_with(&config, state);
 
     daemonize()?;
-    loop {
-        let now: LocalTime = Local::now();
-        for (name, entry) in &config.entries {
-            match &entry.restriction {
-                Restriction::Static { unlock } => {
-                    if unlock.iter().any(|d| d.contains(&now)) {
-                        println!("unlock {}", &name);
-                        let e = state.unlock(&name, &entry);
-                        if let Err(e) = e {
-                            println!("{:?}", e);
-                        }
-                    } else {
-                        println!("lock");
-                        let e = state.lock(&name, &entry);
-                        if let Err(e) = e {
-                            println!("{:?}", e);
-                        }
-                    }
-                }
-                Restriction::Dynamic { period, .. } => {
-                    if state
-                        .last_unlocked
-                        .get(name)
-                        .map(|last_unlocked| now < *last_unlocked + period.clone())
-                        .unwrap_or(true)
-                    {
-                        let _ = state.unlock(&name, &entry);
-                    } else {
-                        let _ = state.lock(&name, &entry);
-                    }
-                }
-            }
-        }
-        thread::sleep(config.interval.to_std().unwrap());
-    }
+    main_loop(config, state)?;
+
+    Ok(())
 }
