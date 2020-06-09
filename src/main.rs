@@ -2,13 +2,14 @@ use anyhow::{anyhow, Context, Result};
 use chrono::offset::Local;
 use chrono::{DateTime, Duration, Timelike};
 use daemonize::Daemonize;
-use nom::character::complete::{digit0, digit1};
+use nom::character::complete::{none_of, digit0, digit1, space0, space1};
 use nom::combinator::all_consuming;
-use nom::{alt, map, map_res, named, opt, recognize, tag, take, tuple};
+use nom::{alt, many1, map, map_res, named, none_of, opt, recognize, tag, take, tuple};
 use serde::{Deserialize, Deserializer};
-use std::borrow::{Borrow, ToOwned};
+use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
 use std::str::FromStr;
 use std::thread;
 
@@ -156,11 +157,26 @@ named!(mh_duration(&str) -> Duration,
         }
     })
 );
+named!(addr_domain(&str) -> String,
+    map!(recognize!(many1!(none_of("\t #"))), |s| s.to_owned())
+);
+named!(comment_out(&str) -> (String, Host),
+    map!(tuple!(space0, tag!("#"), locked_host), |(_, _, (domain, _))| (domain, Host::CommentedOut))
+);
+named!(locked_host(&str) -> (String, Host),
+    map!(tuple!(space0, addr_domain, space1, addr_domain), |(_, _, _, domain)| (domain, Host::Locked))
+);
+named!(host(&str) -> (String, Host),
+    alt!( locked_host
+        | comment_out
+        )
+);
 
 struct State {
     last_unlocked: HashMap<String, LocalTime>,
     last_locked: HashMap<String, LocalTime>,
     is_locked: HashMap<String, bool>,
+    domain_map: HashMap<String, String>,
 }
 
 trait MutDict<V> {
@@ -182,7 +198,7 @@ impl<V> MutDict<V> for HashMap<String, V> {
 
 impl State {
     fn unlock(&mut self, name: &str, entry: &Entry) -> Result<()> {
-        if !self.is_locked[name] {
+        if !self.is_locked.get(name).unwrap_or(&false) {
             return Ok(());
         }
         if let Restriction::Dynamic { cool_time, .. } = entry.restriction {
@@ -198,11 +214,13 @@ impl State {
             self.last_unlocked.set(name, Local::now());
         }
 
+        let _ = self.commit();
+
         Ok(())
     }
 
     fn lock(&mut self, name: &str, entry: &Entry) -> Result<()> {
-        if self.is_locked[name] {
+        if *self.is_locked.get(name).unwrap_or(&false) {
             return Ok(());
         }
 
@@ -211,8 +229,110 @@ impl State {
             self.last_locked.set(name, Local::now());
         }
 
+        let _ = self.commit();
+
         Ok(())
     }
+
+    fn domanin_is_locked(&self, domain: &str) -> bool {
+        self.domain_map
+            .get(domain)
+            .and_then(|entry| self.is_locked.get(entry).cloned())
+            .unwrap_or(false)
+    }
+
+    fn commit(&self) -> Result<()> {
+        let hosts_file = read_hosts()?;
+        let mut hosts = Hosts::parse(hosts_file);
+
+        let mut state_changed = false;
+        for domain in self.domain_map.keys() {
+            if hosts.is_locked(domain) == self.domanin_is_locked(domain) {
+                continue;
+            }
+            state_changed = true;
+            hosts.write_state(domain, self.domanin_is_locked(domain));
+        }
+
+        if !state_changed {
+            return Ok(());
+        }
+
+        let hosts_file = hosts.export();
+        write_hosts(&hosts_file)?;
+
+        Ok(())
+    }
+}
+
+enum Host {
+    Locked,
+    None,
+    CommentedOut,
+}
+
+struct Hosts {
+    hosts_file: Vec<String>,
+    hosts: HashMap<String, (usize, Host)>,
+}
+
+impl Hosts {
+    fn parse(hosts_file: String) -> Hosts {
+        let mut hosts = HashMap::new();
+        for (line_number, line) in hosts_file.lines().enumerate() {
+            if let Ok((_, (domain, host))) = host(line) {
+                hosts.insert(domain, (line_number, host));
+            }
+        }
+
+        Hosts {
+            hosts_file: hosts_file.lines().map(ToOwned::to_owned).collect(),
+            hosts: hosts,
+        }
+    }
+
+    fn is_locked(&self, domain: &str) -> bool {
+        match self
+            .hosts
+            .get(domain)
+            .map(|(_, h)| h)
+            .unwrap_or(&Host::None)
+        {
+            Host::Locked => true,
+            Host::CommentedOut | Host::None => false,
+        }
+    }
+
+    fn host_line(&self, domain: &str, is_locked: bool) -> String {
+        if is_locked {
+            format!("127.0.0.1 {}", domain)
+        } else {
+            format!("# 127.0.0.1 {}", domain)
+        }
+    }
+
+    fn write_state(&mut self, domain: &str, is_locked: bool) {
+        match self.hosts.get(domain).as_deref() {
+            Some((line_number, _)) => {
+                self.hosts_file[*line_number] = self.host_line(domain, is_locked)
+            }
+            None => self.hosts_file.push(self.host_line(domain, is_locked)),
+        }
+    }
+
+    fn export(self) -> String {
+        self.hosts_file.join("\n")
+    }
+}
+
+fn write_hosts(content: &str) -> Result<()> {
+    let _ = fs::write("/etc/hosts", content)?;
+    Ok(())
+}
+
+fn read_hosts() -> Result<String> {
+    let content = fs::read_to_string("/etc/hosts")?;
+    Ok(content)
 }
 
 fn read_config_file() -> Result<String> {
@@ -228,7 +348,11 @@ fn parse_config(config: &str) -> Result<Config> {
 }
 
 fn daemonize() -> Result<()> {
-    let _ = Daemonize::new().pid_file("/tmp/senklot.pid").start()?;
+    let stdout = File::create("/tmp/senklot.log")?;
+    let _ = Daemonize::new()
+        .stdout(stdout)
+        .pid_file("/tmp/senklot.pid")
+        .start()?;
     Ok(())
 }
 
@@ -239,7 +363,18 @@ fn main() -> Result<()> {
         last_unlocked: HashMap::new(),
         last_locked: HashMap::new(),
         is_locked: HashMap::new(),
+        domain_map: HashMap::new(),
     };
+
+    // For debug
+    let hosts = Hosts::parse(read_hosts()?);
+    for domain in hosts.hosts.keys() {
+        println!("{}", domain);
+    }
+    println!("{}", hosts.export());
+    let (i, d) = addr_domain("abc#")?;
+    println!("{}", d);
+
     daemonize()?;
     loop {
         let now: LocalTime = Local::now();
