@@ -13,7 +13,6 @@ use std::fs;
 use std::fs::File;
 use std::path::Path;
 use std::str::FromStr;
-use std::thread;
 use crossbeam::channel;
 use std::process;
 
@@ -235,7 +234,7 @@ impl State {
         bincode::serialize(&self).unwrap()
     }
 
-    fn unlock(&mut self, name: &str, entry: &Entry) -> Result<()> {
+    fn unlock(&mut self, name: &str, entry: &Entry, after_unlock: &Option<String>) -> Result<()> {
         println!("pre {}", self.is_locked.get(name).unwrap_or(&false));
         if !self.is_locked.get(name).unwrap_or(&true) {
             return Ok(());
@@ -257,10 +256,14 @@ impl State {
 
         self.commit()?;
 
+        if let Some(cmd) = after_unlock {
+            process::Command::new("sh").arg("-c").arg(cmd).spawn()?;
+        }
+
         Ok(())
     }
 
-    fn lock(&mut self, name: &str, entry: &Entry) -> Result<()> {
+    fn lock(&mut self, name: &str, entry: &Entry, after_lock: &Option<String>) -> Result<()> {
         if *self.is_locked.get(name).unwrap_or(&false) {
             return Ok(());
         }
@@ -271,6 +274,10 @@ impl State {
         }
 
         let _ = self.commit();
+
+        if let Some(cmd) = after_lock {
+            process::Command::new("sh").arg("-c").arg(cmd).spawn()?;
+        }
 
         Ok(())
     }
@@ -311,11 +318,11 @@ impl State {
             match &entry.restriction {
                 Restriction::Static { unlock } => {
                     if unlock.iter().any(|d| d.contains(&now)) {
-                        if let Err(e) = self.unlock(&name, &entry) {
+                        if let Err(e) = self.unlock(&name, &entry, &config.after_unlock) {
                             println!("{:?}", e);
                         }
                     } else {
-                        if let Err(e) = self.lock(&name, &entry) {
+                        if let Err(e) = self.lock(&name, &entry, &config.after_lock) {
                             println!("{:?}", e);
                         }
                     }
@@ -327,9 +334,9 @@ impl State {
                         .map(|last_unlocked| now < *last_unlocked + period.clone())
                         .unwrap_or(true)
                     {
-                        let _ = self.unlock(&name, &entry);
+                        let _ = self.unlock(&name, &entry, &config.after_unlock);
                     } else {
-                        let _ = self.lock(&name, &entry);
+                        let _ = self.lock(&name, &entry, &config.after_lock);
                     }
                 }
             }
