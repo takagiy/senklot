@@ -439,8 +439,10 @@ fn parse_config(config: &str) -> Result<Config> {
 
 fn daemonize() -> Result<()> {
     fs::create_dir_all("/tmp/senklot")?;
-    let stdout = File::create("/tmp/senklot/stdout.log").context("Unable to open /tmp/senklot/stdout.log")?;
-    let stderr = File::create("/tmp/senklot/stderr.log").context("Unable to open /tmp/senklot/stderr.log")?;
+    let stdout = File::create("/tmp/senklot/stdout.log")
+        .context("Unable to open /tmp/senklot/stdout.log")?;
+    let stderr = File::create("/tmp/senklot/stderr.log")
+        .context("Unable to open /tmp/senklot/stderr.log")?;
     let _ = Daemonize::new()
         .stdout(stdout)
         .stderr(stderr)
@@ -500,6 +502,27 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let arg = clap::App::new(clap::crate_name!())
+        .version(clap::crate_version!())
+        .subcommand(clap::SubCommand::with_name("start").about("Start a daemonized process"))
+        .subcommand(
+            clap::SubCommand::with_name("unlock")
+                .about("Unlock the access to given contents")
+                .arg_from_usage("<NAME> 'Name of contents to be unlocked'"),
+        )
+        .help_message("Print help message")
+        .version_message("Print version message")
+        .setting(clap::AppSettings::UnifiedHelpMessage)
+        .setting(clap::AppSettings::ColorNever)
+        .setting(clap::AppSettings::VersionlessSubcommands)
+        .get_matches_safe()
+        .map_err(|mut e| {
+            if let clap::ErrorKind::HelpDisplayed | clap::ErrorKind::VersionDisplayed = e.kind {
+                e.exit();
+            }
+            e.message = e.message.get(7..).unwrap_or("").to_owned();
+            e
+        })?;
     let config = read_config_file().context("Unable to read config")?;
     let config = parse_config(&config).context("Parse error in config")?;
     let state = read_state_file().context("Unable to read state state file")?;
