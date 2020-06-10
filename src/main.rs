@@ -437,22 +437,16 @@ fn parse_config(config: &str) -> Result<Config> {
     Ok(config)
 }
 
-fn open_file<P: AsRef<Path>>(path: P) -> Result<File> {
-    let file = File::create(path.as_ref()).or_else(|_| File::open(path))?;
-    Ok(file)
-}
-
 fn daemonize() -> Result<()> {
-    let stdout = open_file("/tmp/senklot.log").with_context(|| "cannot open stdout")?;
-    let stderr = open_file("/tmp/senklot.err").with_context(|| "cannot open stderr")?;
+    fs::create_dir_all("/tmp/senklot")?;
+    let stdout = File::create("/tmp/senklot/stdout.log").context("Unable to open /tmp/senklot/stdout.log")?;
+    let stderr = File::create("/tmp/senklot/stderr.log").context("Unable to open /tmp/senklot/stderr.log")?;
     let _ = Daemonize::new()
         .stdout(stdout)
         .stderr(stderr)
-        .user(0)
-        .chown_pid_file(true)
-        .pid_file("/tmp/senklot.pid")
+        .pid_file("/tmp/senklot/senklot.pid")
         .start()
-        .context("Failed to start daemon")?;
+        .context("Unable to start daemon")?;
     Ok(())
 }
 
@@ -508,7 +502,7 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
 fn main() -> Result<()> {
     let config = read_config_file().context("Unable to read config")?;
     let config = parse_config(&config).context("Parse error in config")?;
-    let state = read_state_file().context("Unable to read state file")?;
+    let state = read_state_file().context("Unable to read state state file")?;
     let state = State::load_with(&config, state);
 
     daemonize()?;
