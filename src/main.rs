@@ -7,6 +7,7 @@ use daemonize::Daemonize;
 use nom::character::complete::{digit0, digit1, none_of, space0, space1};
 use nom::combinator::all_consuming;
 use nom::{alt, many1, map, map_res, named, opt, recognize, tag, take, tuple};
+use notify::event::*;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::ToOwned;
@@ -447,6 +448,7 @@ fn daemonize() -> Result<()> {
     let _ = Daemonize::new()
         .stdout(stdout)
         .stderr(stderr)
+        .user(0)
         .chown_pid_file(true)
         .pid_file("/tmp/senklot.pid")
         .start()
@@ -463,20 +465,26 @@ fn exit_channel() -> Result<channel::Receiver<()>> {
     Ok(rx)
 }
 
-fn hosts_modified_channel() -> Result<channel::Receiver<()>> {
+fn hosts_modified_channel() -> Result<(RecommendedWatcher, channel::Receiver<()>)> {
     let (tx, rx) = channel::bounded(0);
-    let mut watcher: RecommendedWatcher = Watcher::new_immediate(move |_| {
-        let _ = tx.send(());
+    let mut watcher: RecommendedWatcher = Watcher::new_immediate(move |event| {
+        if let Ok(Event {
+            kind: EventKind::Modify(ModifyKind::Data(_)),
+            ..
+        }) = event
+        {
+            let _ = tx.send(());
+        }
     })?;
     watcher.watch("/etc/hosts", RecursiveMode::NonRecursive)?;
 
-    Ok(rx)
+    Ok((watcher, rx))
 }
 
 fn main_loop(config: Config, mut state: State) -> Result<()> {
     let ticker = tick(config.interval.to_std().unwrap());
     let exit = exit_channel()?;
-    let hosts_modified = hosts_modified_channel()?;
+    let (_watcher, hosts_modified) = hosts_modified_channel()?;
     loop {
         select! {
             recv(ticker) -> _ => {
@@ -498,9 +506,9 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let config = read_config_file()?;
-    let config = parse_config(&config)?;
-    let state = read_state_file()?;
+    let config = read_config_file().context("Unable to read config")?;
+    let config = parse_config(&config).context("Parse error in config")?;
+    let state = read_state_file().context("Unable to read state file")?;
     let state = State::load_with(&config, state);
 
     daemonize()?;
