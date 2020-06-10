@@ -1,20 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::offset::Local;
 use chrono::{DateTime, Duration, Timelike};
+use crossbeam::channel;
 use crossbeam::channel::{select, tick};
 use daemonize::Daemonize;
 use nom::character::complete::{digit0, digit1, none_of, space0, space1};
 use nom::combinator::all_consuming;
 use nom::{alt, many1, map, map_res, named, opt, recognize, tag, take, tuple};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::path::Path;
-use std::str::FromStr;
-use crossbeam::channel;
 use std::process;
+use std::str::FromStr;
 
 type LocalTime = DateTime<Local>;
 
@@ -147,10 +148,9 @@ named!(float(&str) -> f64,
     map_res!(recognize!(tuple!(digit1, opt!(tuple!(tag!("."), digit0)))), f64::from_str)
 );
 named!(unit(&str) -> DurationUnit,
-    alt!
-    ( map!(tag!("h"), |_| DurationUnit::Hours)
-    | map!(tag!("m") ,|_| DurationUnit::Minutes)
-    )
+    alt!( map!(tag!("h"), |_| DurationUnit::Hours)
+        | map!(tag!("m") ,|_| DurationUnit::Minutes)
+        )
 );
 named!(mh_duration(&str) -> Duration,
     map!(tuple!(float, unit), |(d, u)| {
@@ -235,7 +235,6 @@ impl State {
     }
 
     fn unlock(&mut self, name: &str, entry: &Entry, after_unlock: &Option<String>) -> Result<()> {
-        println!("pre {}", self.is_locked.get(name).unwrap_or(&false));
         if !self.is_locked.get(name).unwrap_or(&true) {
             return Ok(());
         }
@@ -450,27 +449,49 @@ fn daemonize() -> Result<()> {
         .stderr(stderr)
         .chown_pid_file(true)
         .pid_file("/tmp/senklot.pid")
-        .start()?;
+        .start()
+        .context("Failed to start daemon")?;
     Ok(())
+}
+
+fn exit_channel() -> Result<channel::Receiver<()>> {
+    let (tx, rx) = channel::bounded(0);
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })?;
+
+    Ok(rx)
+}
+
+fn hosts_modified_channel() -> Result<channel::Receiver<()>> {
+    let (tx, rx) = channel::bounded(0);
+    let mut watcher: RecommendedWatcher = Watcher::new_immediate(move |_| {
+        let _ = tx.send(());
+    })?;
+    watcher.watch("/etc/hosts", RecursiveMode::NonRecursive)?;
+
+    Ok(rx)
 }
 
 fn main_loop(config: Config, mut state: State) -> Result<()> {
     let ticker = tick(config.interval.to_std().unwrap());
-    let (exit_send, exit) = channel::bounded(1);
-    ctrlc::set_handler(move || {
-        let _ = exit_send.send(());
-    })?;
+    let exit = exit_channel()?;
+    let hosts_modified = hosts_modified_channel()?;
     loop {
         select! {
             recv(ticker) -> _ => {
                 state.update(&config);
-
             },
             recv(exit) -> _ => {
                 if let Err(e) = fs::write("/var/lib/senklot", state.export()) {
                     println!("{:?}", e);
                 }
                 process::exit(0);
+            },
+            recv(hosts_modified) -> _ => {
+                if let Err(e) = state.commit() {
+                    println!("{:?}", e);
+                }
             }
         }
     }
