@@ -14,6 +14,8 @@ use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
+use std::io::prelude::*;
+use std::os::unix::net;
 use std::path::Path;
 use std::process;
 use std::str::FromStr;
@@ -477,10 +479,27 @@ fn hosts_modified_channel() -> Result<(RecommendedWatcher, channel::Receiver<()>
     Ok((watcher, rx))
 }
 
+fn unlock_request_channel() -> Result<channel::Receiver<String>> {
+    let (tx, rx) = channel::bounded(0);
+    let listener = net::UnixListener::bind("/var/lib/senklot.socket")?;
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                let mut buffer = String::new();
+                if let Ok(_) = stream.read_to_string(&mut buffer) {
+                    let _ = tx.send(buffer);
+                };
+            }
+        }
+    });
+    Ok(rx)
+}
+
 fn main_loop(config: Config, mut state: State) -> Result<()> {
     let ticker = tick(config.interval.to_std().unwrap());
     let exit = exit_channel()?;
     let (_watcher, hosts_modified) = hosts_modified_channel()?;
+    let unlock_request = unlock_request_channel()?;
     loop {
         select! {
             recv(ticker) -> _ => {
@@ -496,9 +515,32 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
                 if let Err(e) = state.commit() {
                     println!("{:?}", e);
                 }
+            },
+            recv(unlock_request) -> msg => {
+                if let Ok(name) = msg {
+                   if let Err(e)= state.unlock(&name, &config.entries[&name], &config.after_unlock) {
+                    println!("{:?}", e);
+                   }
+                }
             }
         }
     }
+}
+
+fn run_as_daemon(config: Config) -> Result<()> {
+    let state = read_state_file().context("Unable to read state state file")?;
+    let state = State::load_with(&config, state);
+
+    daemonize()?;
+    main_loop(config, state)?;
+
+    Ok(())
+}
+
+fn run_unlock(_: Config, name: &str) -> Result<()> {
+    let mut stream = net::UnixStream::connect("/var/lib/senklot.socket")?;
+    stream.write_all(name.as_bytes())?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -515,9 +557,13 @@ fn main() -> Result<()> {
         .setting(clap::AppSettings::UnifiedHelpMessage)
         .setting(clap::AppSettings::ColorNever)
         .setting(clap::AppSettings::VersionlessSubcommands)
+        .setting(clap::AppSettings::SubcommandRequiredElseHelp)
         .get_matches_safe()
         .map_err(|mut e| {
-            if let clap::ErrorKind::HelpDisplayed | clap::ErrorKind::VersionDisplayed = e.kind {
+            if let clap::ErrorKind::MissingArgumentOrSubcommand
+            | clap::ErrorKind::HelpDisplayed
+            | clap::ErrorKind::VersionDisplayed = e.kind
+            {
                 e.exit();
             }
             e.message = e.message.get(7..).unwrap_or("").to_owned();
@@ -525,11 +571,14 @@ fn main() -> Result<()> {
         })?;
     let config = read_config_file().context("Unable to read config")?;
     let config = parse_config(&config).context("Parse error in config")?;
-    let state = read_state_file().context("Unable to read state state file")?;
-    let state = State::load_with(&config, state);
 
-    daemonize()?;
-    main_loop(config, state)?;
-
-    Ok(())
+    if let Some(_) = arg.subcommand_matches("start") {
+        run_as_daemon(config)?;
+        Ok(())
+    } else if let Some(arg) = arg.subcommand_matches("unlock") {
+        run_unlock(config, arg.value_of("NAME").unwrap())?;
+        Ok(())
+    } else {
+        unreachable!();
+    }
 }
