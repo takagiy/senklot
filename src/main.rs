@@ -15,8 +15,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::net;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
 
@@ -477,27 +478,49 @@ fn hosts_modified_channel() -> Result<(RecommendedWatcher, channel::Receiver<()>
     Ok((watcher, rx))
 }
 
-fn unlock_request_channel() -> Result<channel::Receiver<String>> {
+fn unlock_request_channel() -> Result<(SocketPath, channel::Receiver<String>)> {
     let (tx, rx) = channel::bounded(0);
-    let listener = net::UnixListener::bind("/var/lib/senklot.socket")?;
+    let (path, listener) = SocketPath::bind("/var/lib/senklot.socket")?;
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
                 let mut buffer = String::new();
-                if let Ok(_) = stream.read_to_string(&mut buffer) {
+                if stream.read_to_string(&mut buffer).is_ok() {
                     let _ = tx.send(buffer);
                 };
             }
         }
     });
-    Ok(rx)
+    Ok((path, rx))
+}
+
+struct SocketPath {
+    path: PathBuf,
+}
+
+impl SocketPath {
+    fn bind<P: AsRef<Path>>(path: P) -> Result<(SocketPath, net::UnixListener)> {
+        let listener = net::UnixListener::bind(path.as_ref())?;
+        Ok((
+            SocketPath {
+                path: path.as_ref().to_path_buf(),
+            },
+            listener,
+        ))
+    }
+}
+
+impl Drop for SocketPath {
+    fn drop(&mut self) {
+        fs::remove_file(&self.path).expect("Unable to remove the socket");
+    }
 }
 
 fn main_loop(config: Config, mut state: State) -> Result<()> {
     let ticker = tick(config.interval.to_std().unwrap());
     let exit = exit_channel()?;
     let (_watcher, hosts_modified) = hosts_modified_channel()?;
-    let unlock_request = unlock_request_channel()?;
+    let (_socket, unlock_request) = unlock_request_channel()?;
     loop {
         select! {
             recv(ticker) -> _ => {
@@ -507,7 +530,7 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
                 if let Err(e) = fs::write("/var/lib/senklot", state.export()) {
                     println!("{:?}", e);
                 }
-                process::exit(0);
+                return Ok(());
             },
             recv(hosts_modified) -> _ => {
                 if let Err(e) = state.commit() {
