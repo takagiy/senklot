@@ -417,9 +417,7 @@ fn read_hosts() -> Result<String> {
 }
 
 fn read_config_file() -> Result<String> {
-    //let xdg_dirs = xdg::BaseDirectories::with_prefix("senklot")?;
-    //let config_file = xdg_dirs.find_config_file("config").ok_or(anyhow!("Could not find config directory"))?;
-    let config_file = "/home/takagiy/.config/senklot/config";
+    let config_file = "/etc/senklot/config";
     let content = fs::read_to_string(config_file)?;
     Ok(content)
 }
@@ -554,8 +552,8 @@ fn main() -> Result<()> {
         )
         .help_message("Print help message")
         .version_message("Print version message")
+        .version_short("v")
         .setting(clap::AppSettings::UnifiedHelpMessage)
-        .setting(clap::AppSettings::ColorNever)
         .setting(clap::AppSettings::VersionlessSubcommands)
         .setting(clap::AppSettings::SubcommandRequiredElseHelp)
         .get_matches_safe()
