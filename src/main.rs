@@ -4,7 +4,6 @@ use crossbeam::channel::{select, tick};
 use daemonize::Daemonize;
 use notify::event::*;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::borrow::ToOwned;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
@@ -14,48 +13,22 @@ use std::path::Path;
 mod config;
 mod state;
 mod util;
+mod cli;
 
 use config::*;
 use state::*;
 use util::*;
+use cli::*;
 
 fn main() -> Result<()> {
-    let arg = clap::App::new(clap::crate_name!())
-        .version(clap::crate_version!())
-        .subcommand(clap::SubCommand::with_name("start").about("Start a daemonized process"))
-        .subcommand(
-            clap::SubCommand::with_name("unlock")
-                .about("Unlock the access to given contents")
-                .arg_from_usage("<NAME> 'Name of contents to be unlocked'"),
-        )
-        .help_message("Print help message")
-        .version_message("Print version message")
-        .version_short("v")
-        .setting(clap::AppSettings::UnifiedHelpMessage)
-        .setting(clap::AppSettings::VersionlessSubcommands)
-        .setting(clap::AppSettings::SubcommandRequiredElseHelp)
-        .get_matches_safe()
-        .map_err(|mut e| {
-            if let clap::ErrorKind::MissingArgumentOrSubcommand
-            | clap::ErrorKind::HelpDisplayed
-            | clap::ErrorKind::VersionDisplayed = e.kind
-            {
-                e.exit();
-            }
-            e.message = e.message.get(7..).unwrap_or("").to_owned();
-            e
-        })?;
+    let args = get_args()?;
+
     let config = read_config_file().context("Unable to read config")?;
     let config = parse_config(&config).context("Parse error in config")?;
 
-    if let Some(_) = arg.subcommand_matches("start") {
-        run_as_daemon(config)?;
-        Ok(())
-    } else if let Some(arg) = arg.subcommand_matches("unlock") {
-        run_unlock(config, arg.value_of("NAME").unwrap())?;
-        Ok(())
-    } else {
-        unreachable!();
+    match args {
+        Args::Start {} => run_as_daemon(config),
+        Args::Unlock { name } => run_unlock(config, &name),
     }
 }
 
@@ -75,15 +48,14 @@ fn run_unlock(_: Config, name: &str) -> Result<()> {
 }
 
 fn main_loop(config: Config, mut state: State) -> Result<()> {
+    daemonize()?;
     let ticker = tick(config.interval.to_std().unwrap());
     let (_watcher, hosts_modified) = hosts_modified_channel()?;
     let (_socket, unlock_request) = unlock_request_channel()?;
-
-    daemonize()?;
-
     let exit = exit_channel()?;
 
     loop {
+        println!("hoge");
         select! {
             recv(ticker) -> _ => {
                 if let Err(e) = state.update(&config) {
@@ -105,6 +77,7 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
             },
             recv(unlock_request) -> msg => {
                 if let Ok(name) = msg {
+                    println!("{}", &name);
                    if let Err(e)= state.unlock(&name, &config.entries[&name], &config.after_unlock) {
                     println!("{:?}", e);
                    }
