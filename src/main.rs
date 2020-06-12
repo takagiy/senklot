@@ -10,15 +10,15 @@ use std::io::prelude::*;
 use std::os::unix::net;
 use std::path::Path;
 
+mod cli;
 mod config;
 mod state;
 mod util;
-mod cli;
 
+use cli::*;
 use config::*;
 use state::*;
 use util::*;
-use cli::*;
 
 fn main() -> Result<()> {
     let args = get_args()?;
@@ -48,14 +48,13 @@ fn run_unlock(_: Config, name: &str) -> Result<()> {
 }
 
 fn main_loop(config: Config, mut state: State) -> Result<()> {
-    daemonize()?;
+    let channels = daemonize()?;
     let ticker = tick(config.interval.to_std().unwrap());
-    let (_watcher, hosts_modified) = hosts_modified_channel()?;
-    let (_socket, unlock_request) = unlock_request_channel()?;
-    let exit = exit_channel()?;
+    let (_watcher, hosts_modified) = channels.hosts_modified;
+    let (_socket, unlock_request) = channels.unlock_request;
+    let exit = channels.exit;
 
     loop {
-        println!("hoge");
         select! {
             recv(ticker) -> _ => {
                 if let Err(e) = state.update(&config) {
@@ -77,7 +76,6 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
             },
             recv(unlock_request) -> msg => {
                 if let Ok(name) = msg {
-                    println!("{}", &name);
                    if let Err(e)= state.unlock(&name, &config.entries[&name], &config.after_unlock) {
                     println!("{:?}", e);
                    }
@@ -87,19 +85,37 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
     }
 }
 
-fn daemonize() -> Result<()> {
+fn daemonize() -> Result<Channels> {
     fs::create_dir_all("/tmp/senklot")?;
+
     let stdout = File::create("/tmp/senklot/stdout.log")
         .context("Unable to open /tmp/senklot/stdout.log")?;
     let stderr = File::create("/tmp/senklot/stderr.log")
         .context("Unable to open /tmp/senklot/stderr.log")?;
-    let _ = Daemonize::new()
+
+    let channels = Daemonize::new()
         .stdout(stdout)
         .stderr(stderr)
         .pid_file("/tmp/senklot/senklot.pid")
+        .privileged_action(prepare_channels)
         .start()
         .context("Unable to start daemon")?;
-    Ok(())
+
+    channels
+}
+
+fn prepare_channels() -> Result<Channels> {
+    Ok(Channels {
+        exit: exit_channel()?,
+        hosts_modified: hosts_modified_channel()?,
+        unlock_request: unlock_request_channel()?,
+    })
+}
+
+struct Channels {
+    exit: channel::Receiver<()>,
+    hosts_modified: (RecommendedWatcher, channel::Receiver<()>),
+    unlock_request: (SocketPath, channel::Receiver<String>),
 }
 
 fn exit_channel() -> Result<channel::Receiver<()>> {
