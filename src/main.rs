@@ -577,11 +577,12 @@ impl<T, E> Optional<T> for Result<T, E> {
 
 fn main_loop(config: Config, mut state: State) -> Result<()> {
     let ticker = tick(config.interval.to_std().unwrap());
-    let exit = exit_channel()?;
     let (_watcher, hosts_modified) = hosts_modified_channel()?;
     let (_socket, unlock_request) = unlock_request_channel()?;
 
     daemonize()?;
+
+    let exit = exit_channel()?;
 
     loop {
         select! {
