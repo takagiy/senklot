@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
-use std::ops::{Deref, DerefMut};
 use std::os::unix::net;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -513,6 +512,44 @@ impl SocketPath {
 impl Drop for SocketPath {
     fn drop(&mut self) {
         fs::remove_file(&self.path).expect("Unable to remove the socket");
+    }
+}
+
+trait Optional<T> {
+    fn into_option(self) -> Option<T>;
+}
+
+trait OptionCond<T> {
+    fn and_if_flat<F: FnOnce(T) -> Option<bool>>(self, pred: F) -> bool;
+    fn or_if_flat<F: FnOnce(T) -> Option<bool>>(self, pred: F) -> bool;
+    fn and_if<F: FnOnce(T) -> bool>(self, pred: F) -> bool;
+    fn or_if<F: FnOnce(T) -> bool>(self, pred: F) -> bool;
+}
+
+impl <T, O: Optional<T>> OptionCond<T> for O {
+    fn and_if_flat<F: FnOnce(T) -> Option<bool>>(self, pred: F) -> bool {
+        self.into_option().and_then(pred).unwrap_or(false)
+    }
+    fn or_if_flat<F: FnOnce(T) -> Option<bool>>(self, pred: F) -> bool {
+        self.into_option().and_then(pred).unwrap_or(true)
+    }
+    fn and_if<F: FnOnce(T) -> bool>(self, pred: F) -> bool {
+        self.into_option().map(pred).unwrap_or(false)
+    }
+    fn or_if<F: FnOnce(T) -> bool>(self, pred: F) -> bool {
+        self.into_option().map(pred).unwrap_or(true)
+    }
+}
+
+impl<T> Optional<T> for Option<T> {
+    fn into_option(self) -> Self {
+        self
+    }
+}
+
+impl<T, E> Optional<T> for Result<T, E> {
+    fn into_option(self) -> Option<T> {
+        self.ok()
     }
 }
 
