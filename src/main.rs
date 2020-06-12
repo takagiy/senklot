@@ -51,6 +51,7 @@ impl StaticDuration {
             hours: time.hour(),
             minutes: time.minute(),
         };
+
         if self.begin < self.end {
             self.begin <= t && t < self.end
         } else {
@@ -238,23 +239,24 @@ impl State {
     }
 
     fn unlock(&mut self, name: &str, entry: &Entry, after_unlock: &Option<String>) -> Result<()> {
-        if !self.is_locked.get(name).unwrap_or(&true) {
+        if self.is_locked.get(name).and_if(|is_locked| !is_locked) {
             return Ok(());
         }
         if let Restriction::Dynamic { cool_time, .. } = entry.restriction {
-            if let Some(last_unlocked) = self.last_unlocked.get(name) {
-                if Local::now() < *last_unlocked + cool_time.clone() {
-                    return Err(anyhow!("Not have been cool down yet"));
-                }
+            if self
+                .last_unlocked
+                .get(name)
+                .and_if(|last_unlocked| Local::now() < *last_unlocked + cool_time.clone())
+            {
+                return Err(anyhow!("Not have been cool down yet"));
             }
         }
 
         self.is_locked.set(name, false);
-        if let Restriction::Dynamic { .. } = entry.restriction {
+
+        if matches!(entry.restriction, Restriction::Dynamic{..}) {
             self.last_unlocked.set(name, Local::now());
         }
-
-        println!("{}", self.is_locked[name]);
 
         self.commit()?;
 
@@ -266,16 +268,17 @@ impl State {
     }
 
     fn lock(&mut self, name: &str, entry: &Entry, after_lock: &Option<String>) -> Result<()> {
-        if *self.is_locked.get(name).unwrap_or(&false) {
+        if self.is_locked.get(name).and_if(|is_locked| *is_locked) {
             return Ok(());
         }
 
         self.is_locked.set(name, true);
-        if let Restriction::Dynamic { .. } = entry.restriction {
+
+        if matches!(entry.restriction, Restriction::Dynamic{..}) {
             self.last_locked.set(name, Local::now());
         }
 
-        let _ = self.commit();
+        self.commit()?;
 
         if let Some(cmd) = after_lock {
             process::Command::new("sh").arg("-c").arg(cmd).spawn()?;
@@ -313,39 +316,55 @@ impl State {
         Ok(())
     }
 
-    fn update(&mut self, config: &Config) {
+    fn update(&mut self, config: &Config) -> Result<(), Vec<anyhow::Error>> {
+        let mut errors = Vec::new();
+
         let now: LocalTime = Local::now();
         for (name, entry) in &config.entries {
             match &entry.restriction {
                 Restriction::Static { unlock } => {
                     if unlock.iter().any(|d| d.contains(&now)) {
-                        if let Err(e) = self.unlock(&name, &entry, &config.after_unlock) {
-                            println!("{:?}", e);
-                        }
+                        self.unlock(&name, &entry, &config.after_unlock)
+                            .err()
+                            .map(|e| {
+                                errors.push(e);
+                            });
                     } else {
-                        if let Err(e) = self.lock(&name, &entry, &config.after_lock) {
-                            println!("{:?}", e);
-                        }
+                        self.lock(&name, &entry, &config.after_lock).err().map(|e| {
+                            errors.push(e);
+                        });
                     }
                 }
                 Restriction::Dynamic { period, .. } => {
-                    if self.last_unlocked
+                    if self
+                        .last_unlocked
                         .get(name)
                         .or_if(|last_unlocked| now < *last_unlocked + period.clone())
                     {
-                        let _ = self.unlock(&name, &entry, &config.after_unlock);
+                        self.unlock(&name, &entry, &config.after_unlock)
+                            .err()
+                            .map(|e| {
+                                errors.push(e);
+                            });
                     } else {
-                        let _ = self.lock(&name, &entry, &config.after_lock);
+                        self.lock(&name, &entry, &config.after_lock).err().map(|e| {
+                            errors.push(e);
+                        });
                     }
                 }
             }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 }
 
 enum Host {
     Locked,
-    None,
     CommentedOut,
 }
 
@@ -370,14 +389,12 @@ impl Hosts {
     }
 
     fn is_locked(&self, domain: &str) -> bool {
-        match self
-            .hosts
-            .get(domain)
-            .map(|(_, h)| h)
-            .unwrap_or(&Host::None)
-        {
-            Host::Locked => true,
-            Host::CommentedOut | Host::None => false,
+        match self.hosts.get(domain) {
+            None => false,
+            Some((_, host)) => match host {
+                Host::CommentedOut => false,
+                Host::Locked => true,
+            },
         }
     }
 
@@ -523,7 +540,7 @@ trait OptionCond<T> {
     fn or_if<F: FnOnce(T) -> bool>(self, pred: F) -> bool;
 }
 
-impl <T, O: Optional<T>> OptionCond<T> for O {
+impl<T, O: Optional<T>> OptionCond<T> for O {
     fn and_if_flat<F: FnOnce(T) -> Option<bool>>(self, pred: F) -> bool {
         self.into_option().and_then(pred).unwrap_or(false)
     }
@@ -558,7 +575,11 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
     loop {
         select! {
             recv(ticker) -> _ => {
-                state.update(&config);
+                if let Err(e) = state.update(&config) {
+                    for e in e {
+                        println!("{:?}", e);
+                    }
+                }
             },
             recv(exit) -> _ => {
                 if let Err(e) = fs::write("/var/lib/senklot", state.export()) {
