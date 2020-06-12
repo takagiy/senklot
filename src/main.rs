@@ -287,8 +287,7 @@ impl State {
     fn domanin_is_locked(&self, domain: &str) -> bool {
         self.domain_map
             .get(domain)
-            .and_then(|entry| self.is_locked.get(entry).cloned())
-            .unwrap_or(false)
+            .and_if_flat(|entry| self.is_locked.get(entry).cloned())
     }
 
     fn commit(&self) -> Result<()> {
@@ -330,11 +329,9 @@ impl State {
                     }
                 }
                 Restriction::Dynamic { period, .. } => {
-                    if self
-                        .last_unlocked
+                    if self.last_unlocked
                         .get(name)
-                        .map(|last_unlocked| now < *last_unlocked + period.clone())
-                        .unwrap_or(true)
+                        .or_if(|last_unlocked| now < *last_unlocked + period.clone())
                     {
                         let _ = self.unlock(&name, &entry, &config.after_unlock);
                     } else {
