@@ -494,6 +494,7 @@ fn hosts_modified_channel() -> Result<(RecommendedWatcher, channel::Receiver<()>
 fn unlock_request_channel() -> Result<(SocketPath, channel::Receiver<String>)> {
     let (tx, rx) = channel::bounded(0);
     let (path, listener) = SocketPath::bind("/var/lib/senklot.socket")?;
+    path.allow_write()?;
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
@@ -520,6 +521,13 @@ impl SocketPath {
             },
             listener,
         ))
+    }
+
+    fn allow_write(&self) -> Result<()> {
+        let mut permissions = fs::metadata(&self.path)?.permissions();
+        permissions.set_readonly(false);
+        let ok = fs::set_permissions(&self.path, permissions)?;
+        Ok(ok)
     }
 }
 
@@ -572,6 +580,9 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
     let exit = exit_channel()?;
     let (_watcher, hosts_modified) = hosts_modified_channel()?;
     let (_socket, unlock_request) = unlock_request_channel()?;
+
+    daemonize()?;
+
     loop {
         select! {
             recv(ticker) -> _ => {
@@ -607,7 +618,6 @@ fn run_as_daemon(config: Config) -> Result<()> {
     let state = read_state_file().context("Unable to read state state file")?;
     let state = State::load_with(&config, state);
 
-    daemonize()?;
     main_loop(config, state)?;
 
     Ok(())
