@@ -80,7 +80,7 @@ impl State {
         self.commit()?;
 
         if let Some(cmd) = after_unlock {
-            process::Command::new("sh").arg("-c").arg(cmd).spawn()?;
+            excute_command(cmd, name)?;
         }
 
         Ok(())
@@ -100,7 +100,7 @@ impl State {
         self.commit()?;
 
         if let Some(cmd) = after_lock {
-            process::Command::new("sh").arg("-c").arg(cmd).spawn()?;
+            excute_command(cmd, name)?;
         }
 
         Ok(())
@@ -262,4 +262,9 @@ fn write_hosts(content: &str) -> Result<()> {
 fn read_hosts() -> Result<String> {
     let content = fs::read_to_string("/etc/hosts")?;
     Ok(content)
+}
+
+fn excute_command(command: &str, content_name: &str) -> Result<()> {
+    process::Command::new("sh").arg("-c").arg(command).env("SENKLOT_CONTENT", content_name).spawn()?;
+    Ok(())
 }
