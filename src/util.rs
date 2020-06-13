@@ -65,6 +65,7 @@ pub struct SocketPath {
 
 impl SocketPath {
     pub fn bind<P: AsRef<Path>>(path: P) -> Result<(SocketPath, net::UnixListener)> {
+        let _ = fs::remove_file(path.as_ref());
         let listener = net::UnixListener::bind(path.as_ref())?;
         Ok((
             SocketPath {
