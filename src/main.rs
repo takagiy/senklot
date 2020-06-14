@@ -8,14 +8,17 @@ use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
 use std::os::unix::net;
+use std::net::Shutdown;
 
 mod cli;
 mod config;
+mod message;
 mod state;
 mod util;
 
 use cli::*;
 use config::*;
+use message::*;
 use state::*;
 use util::*;
 
@@ -32,8 +35,8 @@ fn main() -> Result<()> {
 }
 
 fn run_as_daemon(config: Config) -> Result<()> {
-    let state =
-        State::read_with_config(&config, "/var/lib/senklot").context("Unable to read state file")?;
+    let state = State::read_with_config(&config, "/var/lib/senklot")
+        .context("Unable to read state file")?;
 
     main_loop(config, state)?;
 
@@ -43,6 +46,29 @@ fn run_as_daemon(config: Config) -> Result<()> {
 fn run_unlock(_: Config, name: &str) -> Result<()> {
     let mut stream = net::UnixStream::connect("/var/lib/senklot.socket")?;
     stream.write_all(name.as_bytes())?;
+    stream.shutdown(Shutdown::Write)?;
+    let response = {
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        bincode::deserialize(&response.as_bytes())?
+    };
+
+    match response {
+        UnlockResponse::Success { locked_at } => {
+            println!("{}", locked_at);
+        }
+        UnlockResponse::Fail { cause, unlocked_at } => {
+            println!(
+                "{}\n{}",
+                cause,
+                unlocked_at
+                    .map(|t| format!("{}", t))
+                    .as_deref()
+                    .unwrap_or("")
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -74,10 +100,10 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
                 }
             },
             recv(unlock_request) -> msg => {
-                if let Ok(name) = msg {
-                   if let Err(e)= state.unlock(&name, &config.entries[&name], &config.after_unlock) {
-                    println!("{:?}", e);
-                   }
+                if let Ok((socket, name)) = msg {
+                    if let Err(e)= state.request_unlock(socket, &name, &config.entries[&name], &config.after_unlock) {
+                        println!("{:?}", e);
+                    }
                 }
             }
         }
@@ -114,7 +140,7 @@ fn prepare_channels() -> Result<Channels> {
 struct Channels {
     exit: channel::Receiver<()>,
     hosts_modified: (RecommendedWatcher, channel::Receiver<()>),
-    unlock_request: (SocketPath, channel::Receiver<String>),
+    unlock_request: (SocketPath, channel::Receiver<(net::UnixStream, String)>),
 }
 
 fn exit_channel() -> Result<channel::Receiver<()>> {
@@ -142,7 +168,7 @@ fn hosts_modified_channel() -> Result<(RecommendedWatcher, channel::Receiver<()>
     Ok((watcher, rx))
 }
 
-fn unlock_request_channel() -> Result<(SocketPath, channel::Receiver<String>)> {
+fn unlock_request_channel() -> Result<(SocketPath, channel::Receiver<(net::UnixStream, String)>)> {
     let (tx, rx) = channel::bounded(0);
     let (path, listener) = SocketPath::bind("/var/lib/senklot.socket")?;
     path.allow_write()?;
@@ -151,7 +177,7 @@ fn unlock_request_channel() -> Result<(SocketPath, channel::Receiver<String>)> {
             if let Ok(mut stream) = stream {
                 let mut buffer = String::new();
                 if stream.read_to_string(&mut buffer).is_ok() {
-                    let _ = tx.send(buffer);
+                    let _ = tx.send((stream, buffer));
                 };
             }
         }
@@ -169,4 +195,3 @@ fn parse_config(config: &str) -> Result<Config> {
     let config = toml::from_str(config)?;
     Ok(config)
 }
-

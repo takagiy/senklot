@@ -5,10 +5,13 @@ use nom::{alt, many1, map, named, recognize, tag, tuple};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::prelude::*;
+use std::os::unix::net;
 use std::path::{Path, PathBuf};
 use std::process;
 
 use crate::config::*;
+use crate::message::*;
 use crate::util::*;
 
 #[derive(Deserialize, Serialize)]
@@ -73,6 +76,67 @@ impl State {
 
     pub fn export(&self) -> Vec<u8> {
         bincode::serialize(&self).unwrap()
+    }
+
+    pub fn request_unlock(
+        &mut self,
+        mut socket: net::UnixStream,
+        name: &str,
+        entry: &Entry,
+        after_unlock: &Option<String>,
+    ) -> Result<()> {
+        let result = self.unlock(name, entry, after_unlock);
+
+        let response = {
+            let response = match result {
+                Ok(()) => UnlockResponse::Success {
+                    locked_at: self.lock_time_of(name, entry),
+                },
+                Err(e) => UnlockResponse::Fail {
+                    unlocked_at: self.unlock_time_of(name, entry),
+                    cause: format!("{:?}", e),
+                },
+            };
+
+            bincode::serialize(&response)?
+        };
+
+        socket.write_all(&response)?;
+
+        Ok(())
+    }
+
+    fn lock_time_of(&self, name: &str, entry: &Entry) -> LocalTime {
+        let now = Local::now();
+
+        match &entry.restriction {
+            Restriction::Static { unlock } => {
+                let currently_unlocking = unlock.iter().find(|d| d.contains(&now)).unwrap();
+                let end = currently_unlocking.end;
+
+                if now.time() <= end {
+                    Local::today().and_time(end)
+                } else {
+                    Local::today().succ().and_time(end)
+                }
+                .unwrap()
+            }
+            Restriction::Dynamic { period, .. } => self.last_unlocked[name] + period.clone(),
+        }
+    }
+
+    fn unlock_time_of(&self, name: &str, entry: &Entry) -> Option<LocalTime> {
+        if self.is_locked.get(name).or_if(|is_locked| !is_locked) {
+            return None;
+        }
+
+        match entry.restriction {
+            Restriction::Static { .. } => None,
+            Restriction::Dynamic { cool_time, .. } => self
+                .last_locked
+                .get(name)
+                .map(|last_locked| *last_locked + cool_time),
+        }
     }
 
     pub fn unlock(

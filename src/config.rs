@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::offset::Local;
-use chrono::{DateTime, Duration, Timelike};
+use chrono::{DateTime, Duration, NaiveTime as Time};
 use nom::character::complete::{digit0, digit1};
 use nom::combinator::all_consuming;
 use nom::{alt, map, map_res, named, opt, recognize, tag, take, tuple};
@@ -10,24 +10,6 @@ use std::str::FromStr;
 
 pub type LocalTime = DateTime<Local>;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub struct Time {
-    pub hours: u32,
-    pub minutes: u32,
-}
-
-impl<'a> Deserialize<'a> for Time {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'a>,
-    {
-        use serde::de::Error;
-        let string = Deserialize::deserialize(deserializer)?;
-        let (_, o) = all_consuming(time)(string).map_err(Error::custom)?;
-        Ok(o)
-    }
-}
-
 pub struct StaticDuration {
     pub begin: Time,
     pub end: Time,
@@ -35,10 +17,7 @@ pub struct StaticDuration {
 
 impl StaticDuration {
     pub fn contains(&self, time: &LocalTime) -> bool {
-        let t = Time {
-            hours: time.hour(),
-            minutes: time.minute(),
-        };
+        let t = time.time();
 
         if self.begin < self.end {
             self.begin <= t && t < self.end
@@ -128,7 +107,7 @@ named!(time(&str) -> Time,
             return Err(anyhow!("Invalid minutes"));
         }
 
-        Ok(Time{hours: h, minutes: m})
+        Ok(Time::from_hms(h, m, 0))
     })
 );
 named!(static_duration(&str) -> StaticDuration,
