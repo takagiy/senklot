@@ -8,7 +8,6 @@ use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
 use std::os::unix::net;
-use std::path::Path;
 
 mod cli;
 mod config;
@@ -33,8 +32,8 @@ fn main() -> Result<()> {
 }
 
 fn run_as_daemon(config: Config) -> Result<()> {
-    let state = read_state_file().context("Unable to read state state file")?;
-    let state = State::load_with(&config, state);
+    let state =
+        State::read_with_config(&config, "/var/lib/senklot").context("Unable to read state file")?;
 
     main_loop(config, state)?;
 
@@ -171,12 +170,3 @@ fn parse_config(config: &str) -> Result<Config> {
     Ok(config)
 }
 
-fn read_state_file() -> Result<Option<Vec<u8>>> {
-    let path = Path::new("/var/lib/senklot");
-    if path.is_file() {
-        let content = fs::read(path)?;
-        Ok(Some(content))
-    } else {
-        Ok(None)
-    }
-}

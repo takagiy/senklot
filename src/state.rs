@@ -5,6 +5,7 @@ use nom::{alt, many1, map, named, recognize, tag, tuple};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use crate::config::*;
@@ -17,26 +18,47 @@ pub struct State {
     is_locked: HashMap<String, bool>,
     #[serde(skip)]
     domain_map: HashMap<String, String>,
+    #[serde(skip)]
+    path: PathBuf,
+}
+
+fn read_state_file(path: &str) -> Result<Option<Vec<u8>>> {
+    let path = Path::new(path);
+    if path.is_file() {
+        let content = fs::read(path)?;
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
 }
 
 impl State {
-    pub fn load_with(config: &Config, state_file: Option<Vec<u8>>) -> State {
-        let mut domain_map = HashMap::new();
-        for (name, entry) in &config.entries {
-            for domain in &entry.domains {
-                domain_map.insert(domain.clone(), name.clone());
-            }
-        }
+    pub fn read_with_config(config: &Config, path: &str) -> Result<State> {
+        let domain_map = {
+            let mut domain_map = HashMap::new();
 
-        let state = match state_file {
-            Some(state_file) => bincode::deserialize(&state_file).unwrap_or(State::empty()),
-            None => State::empty(),
+            for (name, entry) in &config.entries {
+                for domain in &entry.domains {
+                    domain_map.insert(domain.clone(), name.clone());
+                }
+            }
+            domain_map
         };
 
-        State {
+        let previous_state = {
+            let previous_state = read_state_file(path)?;
+
+            match previous_state {
+                Some(state) => bincode::deserialize(&state).unwrap_or(State::empty()),
+                None => State::empty(),
+            }
+        };
+
+        Ok(State {
             domain_map: domain_map,
-            ..state
-        }
+            path: path.to_owned().into(),
+            ..previous_state
+        })
     }
 
     fn empty() -> State {
@@ -45,6 +67,7 @@ impl State {
             last_unlocked: HashMap::new(),
             last_locked: HashMap::new(),
             is_locked: HashMap::new(),
+            path: PathBuf::new(),
         }
     }
 
@@ -112,25 +135,34 @@ impl State {
             .and_if_flat(|entry| self.is_locked.get(entry).cloned())
     }
 
+    fn save(&self) -> Result<()> {
+        fs::write(&self.path, self.export())?;
+        Ok(())
+    }
+
     pub fn commit(&self) -> Result<()> {
-        let hosts_file = read_hosts()?;
-        let mut hosts = Hosts::parse(hosts_file);
+        let (hosts, state_is_changed) = {
+            let hosts = read_hosts()?;
+            let mut hosts = Hosts::parse(hosts);
+            let mut state_is_changed = false;
 
-        let mut state_changed = false;
-        for domain in self.domain_map.keys() {
-            if hosts.is_locked(domain) == self.domanin_is_locked(domain) {
-                continue;
+            for domain in self.domain_map.keys() {
+                let lock_state = self.domanin_is_locked(domain);
+
+                if lock_state != hosts.is_locked(domain) {
+                    state_is_changed = true;
+                    hosts.write_state(domain, lock_state);
+                }
             }
-            state_changed = true;
-            hosts.write_state(domain, self.domanin_is_locked(domain));
-        }
+            (hosts, state_is_changed)
+        };
 
-        if !state_changed {
+        if !state_is_changed {
             return Ok(());
         }
 
-        let hosts_file = hosts.export();
-        write_hosts(&hosts_file)?;
+        hosts.save()?;
+        self.save()?;
 
         Ok(())
     }
@@ -249,14 +281,14 @@ impl Hosts {
         }
     }
 
-    fn export(self) -> String {
+    fn export(&self) -> String {
         self.hosts_file.join("\n")
     }
-}
 
-fn write_hosts(content: &str) -> Result<()> {
-    let _ = fs::write("/etc/hosts", content)?;
-    Ok(())
+    fn save(&self) -> Result<()> {
+        fs::write("/etc/hosts", self.export())?;
+        Ok(())
+    }
 }
 
 fn read_hosts() -> Result<String> {
@@ -265,6 +297,10 @@ fn read_hosts() -> Result<String> {
 }
 
 fn excute_command(command: &str, content_name: &str) -> Result<()> {
-    process::Command::new("sh").arg("-c").arg(command).env("SENKLOT_CONTENT", content_name).spawn()?;
+    process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("SENKLOT_CONTENT", content_name)
+        .spawn()?;
     Ok(())
 }
