@@ -101,7 +101,9 @@ fn main_loop(config: Config, mut state: State) -> Result<()> {
             },
             recv(unlock_request) -> msg => {
                 if let Ok((socket, name)) = msg {
-                    if let Err(e)= state.request_unlock(socket, &name, &config.entries[&name], &config.after_unlock) {
+                    if let Err(e)
+                        = state.request_unlock(socket, &name, &config.entries[&name], &config.after_unlock)
+                    {
                         println!("{:?}", e);
                     }
                 }
